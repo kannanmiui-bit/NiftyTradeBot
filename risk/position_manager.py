@@ -17,7 +17,7 @@ from typing import Optional
 
 import pytz
 
-from options.strike_selector import SelectedOption
+from options.strike_selector import SelectedOption, SpreadLegs
 from strategy.selector import SignalResult
 from utils.logger import get_logger
 
@@ -31,8 +31,8 @@ STATE_PATH = os.path.join(
 
 @dataclass
 class PositionState:
-    tradingsymbol: str
-    entry_price: float
+    tradingsymbol: str         # for buy: option symbol; for spread: sell leg symbol
+    entry_price: float         # for buy: premium paid; for spread: net credit received
     quantity: int
     entry_time: str            # ISO string for JSON serializability
     peak_price: float
@@ -43,6 +43,8 @@ class PositionState:
     exit_time: Optional[str] = None
     signal_scores: dict = field(default_factory=dict)
     option_type: str = ""
+    strategy_type: str = "buy"         # "buy" | "sell_spread"
+    hedge_tradingsymbol: str = ""      # spread only: OTM long (hedge) leg symbol
 
 
 class PositionManager:
@@ -95,6 +97,101 @@ class PositionManager:
             f"qty={option.quantity} | Scores={signal.individual_scores}"
         )
         return self._position
+
+    def open_spread_position(
+        self,
+        spread: SpreadLegs,
+        signal: SignalResult,
+        confirmed_net_credit: Optional[float] = None,
+    ) -> PositionState:
+        """Record a new open credit spread position."""
+        net_credit = confirmed_net_credit or spread.net_credit
+        now = datetime.now(IST)
+
+        self._position = PositionState(
+            tradingsymbol=spread.sell_tradingsymbol,
+            entry_price=net_credit,
+            quantity=spread.quantity,
+            entry_time=now.isoformat(),
+            peak_price=net_credit,
+            trailing_activated=False,
+            status="OPEN",
+            signal_scores=signal.individual_scores.copy(),
+            option_type=spread.option_type,
+            strategy_type="sell_spread",
+            hedge_tradingsymbol=spread.buy_tradingsymbol,
+        )
+        self.save_state()
+        logger.info(
+            f"Spread position opened: SELL {spread.sell_tradingsymbol} | "
+            f"BUY {spread.buy_tradingsymbol} | Credit={net_credit:.2f} "
+            f"qty={spread.quantity}"
+        )
+        return self._position
+
+    def monitor_spread(self, cost_to_close: float) -> Optional[str]:
+        """
+        Monitor a credit spread position.
+        cost_to_close = current sell_leg_ltp - buy_leg_ltp (what it costs to close now).
+
+        Profit when cost_to_close < entry_credit (spread narrowed).
+        Loss   when cost_to_close > entry_credit (spread widened).
+        """
+        if self._position is None or self._position.status != "OPEN":
+            return None
+
+        pos = self._position
+        entry_credit = pos.entry_price
+        pnl = entry_credit - cost_to_close
+        profit_pct = pnl / entry_credit if entry_credit > 0 else 0.0
+
+        logger.debug(
+            f"Spread monitor | CTC={cost_to_close:.2f} | Credit={entry_credit:.2f} | "
+            f"P&L={pnl:+.2f} ({profit_pct:+.1%}) | "
+            f"Trailing={'ON' if pos.trailing_activated else 'OFF'}"
+        )
+
+        # Step 1 — Hard stop loss (loss exceeds sl_pct * credit)
+        if profit_pct <= -self.sl_pct:
+            logger.info(f"SPREAD STOP LOSS | CTC={cost_to_close:.2f} ({profit_pct:+.1%})")
+            return "STOP_LOSS"
+
+        # Step 2 — Fixed target (captured target_pct of credit)
+        if profit_pct >= self.target_pct:
+            logger.info(f"SPREAD TARGET | CTC={cost_to_close:.2f} ({profit_pct:+.1%})")
+            return "TARGET"
+
+        # Step 3 — Update peak profit (lowest ctc = peak profit for sellers)
+        if cost_to_close < pos.peak_price:
+            pos.peak_price = cost_to_close
+            self.save_state()
+
+        peak_profit_pct = (entry_credit - pos.peak_price) / entry_credit if entry_credit > 0 else 0.0
+
+        # Step 4 — Activate trailing SL
+        if not pos.trailing_activated and peak_profit_pct >= self.trail_trigger_pct:
+            pos.trailing_activated = True
+            logger.info(
+                f"Spread trailing SL ACTIVATED | Peak CTC={pos.peak_price:.2f} | "
+                f"Peak profit={peak_profit_pct:+.1%}"
+            )
+            self.save_state()
+
+        # Step 5 — Apply trailing SL (ctc risen above trail_step from peak)
+        if pos.trailing_activated:
+            trail_sl_ctc = pos.peak_price * (1 + self.trail_step_pct)
+            if cost_to_close >= trail_sl_ctc:
+                logger.info(
+                    f"SPREAD TRAILING SL | CTC={cost_to_close:.2f} | "
+                    f"Trail SL CTC={trail_sl_ctc:.2f}"
+                )
+                return "TRAILING_SL"
+
+        # Step 6 — Time-based squareoff
+        if datetime.now(IST).time() >= self._squareoff_time:
+            return "SQUAREOFF"
+
+        return None
 
     def monitor(self, current_ltp: float) -> Optional[str]:
         """
@@ -196,7 +293,11 @@ class PositionManager:
         total = 0.0
         for p in self._closed_today:
             if p.exit_price is not None:
-                total += (p.exit_price - p.entry_price) * p.quantity
+                if p.strategy_type == "sell_spread":
+                    # entry_price = net_credit received; exit_price = cost_to_close at exit
+                    total += (p.entry_price - p.exit_price) * p.quantity
+                else:
+                    total += (p.exit_price - p.entry_price) * p.quantity
         return total
 
     def get_trade_count_today(self) -> int:

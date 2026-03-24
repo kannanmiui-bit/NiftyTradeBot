@@ -112,6 +112,7 @@ def main():
     strike_sel = StrikeSelector(
         chain, kite, config.lot_size, config.strike_step,
         config.otm_strikes, config.num_lots, config.exchange,
+        config.hedge_otm_strikes,
     )
     position_mgr = PositionManager(
         config.target_pct, config.sl_pct,
@@ -175,40 +176,51 @@ def main():
                 logger.info(f"Trade blocked by risk: {reason}")
                 return
 
-            # Select option
+            # Select option / spread
             index_ltp_key = INDEX_LTP_KEYS[config.index]
             index_ltp_data = kite.get_ltp([index_ltp_key])
             index_ltp = index_ltp_data[index_ltp_key]["last_price"]
 
-            option = strike_sel.select(signal, index_ltp)
-
-            notifier.alert_entry(
-                option.tradingsymbol, option.entry_ltp,
-                signal.individual_scores, signal.direction
-            )
-
-            if paper_mode:
-                logger.info(
-                    f"[PAPER] Would BUY {option.tradingsymbol} "
-                    f"@ {option.entry_ltp:.2f} qty={option.quantity}"
+            if config.strategy_type == "sell_spread":
+                spread = strike_sel.select_spread(signal, index_ltp)
+                notifier.alert_entry(
+                    f"SPREAD {spread.sell_tradingsymbol}/{spread.buy_tradingsymbol}",
+                    spread.net_credit, signal.individual_scores, signal.direction
                 )
-                position_mgr.open_position(option, signal)
-                return
-
-            # Place real order
-            order_id = order_mgr.place_buy_order(
-                option.tradingsymbol, option.quantity
-            )
-            logger.info(f"Order placed: {order_id}")
-
-            # Fetch confirmed fill price
-            time.sleep(1)
-            order = order_mgr.get_order_status(order_id)
-            fill_price = (
-                order.get("average_price") or option.entry_ltp
-                if order else option.entry_ltp
-            )
-            position_mgr.open_position(option, signal, confirmed_entry_price=fill_price)
+                if paper_mode:
+                    logger.info(
+                        f"[PAPER] Would SELL {spread.sell_tradingsymbol} / "
+                        f"BUY {spread.buy_tradingsymbol} | Credit={spread.net_credit:.2f}"
+                    )
+                    position_mgr.open_spread_position(spread, signal)
+                    return
+                sell_id, buy_id = order_mgr.place_spread_open(
+                    spread.sell_tradingsymbol, spread.buy_tradingsymbol, spread.quantity
+                )
+                logger.info(f"Spread orders placed: sell={sell_id} hedge={buy_id}")
+                position_mgr.open_spread_position(spread, signal)
+            else:
+                option = strike_sel.select(signal, index_ltp)
+                notifier.alert_entry(
+                    option.tradingsymbol, option.entry_ltp,
+                    signal.individual_scores, signal.direction
+                )
+                if paper_mode:
+                    logger.info(
+                        f"[PAPER] Would BUY {option.tradingsymbol} "
+                        f"@ {option.entry_ltp:.2f} qty={option.quantity}"
+                    )
+                    position_mgr.open_position(option, signal)
+                    return
+                order_id = order_mgr.place_buy_order(option.tradingsymbol, option.quantity)
+                logger.info(f"Order placed: {order_id}")
+                time.sleep(1)
+                order = order_mgr.get_order_status(order_id)
+                fill_price = (
+                    order.get("average_price") or option.entry_ltp
+                    if order else option.entry_ltp
+                )
+                position_mgr.open_position(option, signal, confirmed_entry_price=fill_price)
 
         except Exception as e:
             logger.exception(f"Error in signal_check_job: {e}")
@@ -221,28 +233,41 @@ def main():
 
         pos = position_mgr.current_position()
         try:
-            ltp_key = f"NFO:{pos.tradingsymbol}"
-            ltp_data = kite.get_ltp([ltp_key])
-            current_ltp = ltp_data[ltp_key]["last_price"]
+            if pos.strategy_type == "sell_spread":
+                # Fetch both legs, compute cost-to-close
+                sell_key  = f"NFO:{pos.tradingsymbol}"
+                hedge_key = f"NFO:{pos.hedge_tradingsymbol}"
+                ltp_data = kite.get_ltp([sell_key, hedge_key])
+                sell_ltp  = ltp_data[sell_key]["last_price"]
+                hedge_ltp = ltp_data[hedge_key]["last_price"]
+                cost_to_close = sell_ltp - hedge_ltp
+                exit_reason = position_mgr.monitor_spread(cost_to_close)
+                exit_price_for_log = cost_to_close
+            else:
+                ltp_key = f"NFO:{pos.tradingsymbol}"
+                ltp_data = kite.get_ltp([ltp_key])
+                current_ltp = ltp_data[ltp_key]["last_price"]
+                exit_reason = position_mgr.monitor(current_ltp)
+                exit_price_for_log = current_ltp
 
-            exit_reason = position_mgr.monitor(current_ltp)
             if exit_reason is None:
                 return
 
             # Exit triggered
             if paper_mode:
-                logger.info(
-                    f"[PAPER] EXIT {exit_reason} | {pos.tradingsymbol} "
-                    f"@ {current_ltp:.2f}"
-                )
+                logger.info(f"[PAPER] EXIT {exit_reason} | {pos.tradingsymbol} @ {exit_price_for_log:.2f}")
             else:
-                order_mgr.place_exit_order(
-                    pos.tradingsymbol, pos.quantity, exit_reason
-                )
+                if pos.strategy_type == "sell_spread":
+                    order_mgr.place_spread_close(
+                        pos.tradingsymbol, pos.hedge_tradingsymbol,
+                        pos.quantity, exit_reason
+                    )
+                else:
+                    order_mgr.place_exit_order(pos.tradingsymbol, pos.quantity, exit_reason)
                 order_mgr.log_trade(
                     tradingsymbol=pos.tradingsymbol,
                     entry_price=pos.entry_price,
-                    exit_price=current_ltp,
+                    exit_price=exit_price_for_log,
                     quantity=pos.quantity,
                     entry_time=datetime.fromisoformat(pos.entry_time),
                     exit_time=datetime.now(IST),
@@ -250,10 +275,10 @@ def main():
                     signal_scores=pos.signal_scores,
                 )
 
-            position_mgr.close_position(exit_reason, current_ltp)
+            position_mgr.close_position(exit_reason, exit_price_for_log)
             notifier.alert_exit(
                 pos.tradingsymbol, pos.entry_price,
-                current_ltp, exit_reason, pos.quantity
+                exit_price_for_log, exit_reason, pos.quantity
             )
 
         except Exception as e:
@@ -266,18 +291,30 @@ def main():
             logger.info("Squareoff time: force-closing open position.")
             pos = position_mgr.current_position()
             try:
-                ltp_key = f"NFO:{pos.tradingsymbol}"
-                ltp_data = kite.get_ltp([ltp_key])
-                current_ltp = ltp_data[ltp_key]["last_price"]
+                if pos.strategy_type == "sell_spread":
+                    sell_key  = f"NFO:{pos.tradingsymbol}"
+                    hedge_key = f"NFO:{pos.hedge_tradingsymbol}"
+                    ltp_data = kite.get_ltp([sell_key, hedge_key])
+                    exit_price = ltp_data[sell_key]["last_price"] - ltp_data[hedge_key]["last_price"]
+                else:
+                    ltp_key = f"NFO:{pos.tradingsymbol}"
+                    ltp_data = kite.get_ltp([ltp_key])
+                    exit_price = ltp_data[ltp_key]["last_price"]
             except Exception:
-                current_ltp = pos.entry_price  # fallback
+                exit_price = pos.entry_price  # fallback
 
             if not paper_mode:
-                order_mgr.place_exit_order(pos.tradingsymbol, pos.quantity, "SQUAREOFF")
-            position_mgr.close_position("SQUAREOFF", current_ltp)
+                if pos.strategy_type == "sell_spread":
+                    order_mgr.place_spread_close(
+                        pos.tradingsymbol, pos.hedge_tradingsymbol,
+                        pos.quantity, "SQUAREOFF"
+                    )
+                else:
+                    order_mgr.place_exit_order(pos.tradingsymbol, pos.quantity, "SQUAREOFF")
+            position_mgr.close_position("SQUAREOFF", exit_price)
             notifier.alert_exit(
                 pos.tradingsymbol, pos.entry_price,
-                current_ltp, "SQUAREOFF", pos.quantity
+                exit_price, "SQUAREOFF", pos.quantity
             )
 
     # ── Schedule jobs ────────────────────────────────────────────────────────

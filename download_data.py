@@ -44,7 +44,7 @@ def fetch_historical(kite: KiteConnect, token: int, from_dt: datetime, to_dt: da
 
     while current < to_dt:
         chunk_end = min(current + timedelta(days=MAX_CHUNK_DAYS), to_dt)
-        print(f"  Fetching {current.date()} → {chunk_end.date()} ...", end=" ", flush=True)
+        print(f"  Fetching {current.date()} to {chunk_end.date()} ...", end=" ", flush=True)
 
         try:
             records = kite.historical_data(
@@ -135,7 +135,7 @@ def main():
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     print(f"\nDownloading {args.index} {args.interval} candles")
-    print(f"Range: {from_dt.date()} → {to_dt.date()}")
+    print(f"Range: {from_dt.date()} to {to_dt.date()}")
     print(f"Token: {token}")
     print()
 
@@ -148,7 +148,7 @@ def main():
     # Save with datetime as a column (not index) for easy CSV loading
     df.reset_index().to_csv(out_path, index=False)
     print(f"\nSaved {len(df)} candles to: {out_path}")
-    print(f"Date range in file: {df.index[0]} → {df.index[-1]}")
+    print(f"Date range in file: {df.index[0]} to {df.index[-1]}")
     print(f"\nRun backtest with:")
     print(f"  python run_backtest.py --csv {out_path} --index {args.index}")
 

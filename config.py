@@ -39,6 +39,10 @@ class BotConfig:
     otm_strikes: int     # 0 = ATM, 1 = 1 OTM, etc.
     num_lots: int
 
+    # ── Strategy type ─────────────────────────────────────────────────────────
+    strategy_type: str   # "buy" | "sell_spread"
+    hedge_otm_strikes: int  # strikes OTM for hedge leg (sell_spread only)
+
     # ── Strategy params ──────────────────────────────────────────────────────
     supertrend_period: int
     supertrend_mult: float
@@ -89,6 +93,10 @@ def load_config() -> BotConfig:
         strike_step=_opt("STRIKE_STEP", 50, int),
         otm_strikes=_opt("OTM_STRIKES", 0, int),
         num_lots=_opt("NUM_LOTS", 1, int),
+
+        # Strategy type
+        strategy_type=_opt("STRATEGY_TYPE", "buy"),
+        hedge_otm_strikes=_opt("HEDGE_OTM_STRIKES", 2, int),
 
         # Strategy
         supertrend_period=_opt("SUPERTREND_PERIOD", 7, int),

@@ -93,6 +93,14 @@ class BacktestEngine:
         num_lots: int = 1,
         # Premium approximation (when no options CSV)
         option_premium_pct: float = 0.015,  # 1.5% of index as rough ATM premium
+        # Sell spread params
+        strategy_type: str = "buy",         # "buy" | "sell_spread"
+        hedge_otm_strikes: int = 2,
+        strike_step: int = 50,
+        credit_ratio: float = 0.35,         # net credit as % of spread width
+        spread_net_delta: float = 0.30,     # net delta of the spread
+        sl_loss_multiple: float = 1.5,      # SL when loss = N * net_credit
+        target_capture_pct: float = 0.50,   # TP when N% of credit captured
     ):
         self.indicators = IndicatorEngine(
             supertrend_period, supertrend_mult, rsi_period, ema_fast, ema_slow
@@ -112,6 +120,12 @@ class BacktestEngine:
         self.num_lots = num_lots
         self.quantity = lot_size * num_lots
         self.option_premium_pct = option_premium_pct
+        self.strategy_type = strategy_type
+        self.spread_width = hedge_otm_strikes * strike_step  # points (= rupees/unit)
+        self.credit_ratio = credit_ratio
+        self.spread_net_delta = spread_net_delta
+        self.sl_loss_multiple = sl_loss_multiple
+        self.target_capture_pct = target_capture_pct
 
         nt_h, nt_m = map(int, no_new_trade_after.split(":"))
         self._no_new_trade_after = dtime(nt_h, nt_m)
@@ -210,12 +224,22 @@ class BacktestEngine:
                 continue
 
             # ── Open trade ─────────────────────────────────────────────────
-            entry_price = self._estimate_option_premium(candle["close"], signal.direction)
+            if self.strategy_type == "sell_spread":
+                net_credit = round(self.spread_width * self.credit_ratio, 2)
+                entry_price = net_credit
+                symbol = f"SPREAD_{signal.direction}_BT"
+            else:
+                entry_price = self._estimate_option_premium(candle["close"], signal.direction)
+                symbol = f"{signal.direction}_BT"
+
             state.open_trade = {
-                "symbol": f"{signal.direction}_BT",
+                "symbol": symbol,
                 "direction": signal.direction,
                 "entry_price": entry_price,
                 "entry_time": candle_time,
+                "index_entry_price": candle["close"],
+                # for buy: peak_price tracks highest option price (sell when high)
+                # for sell_spread: peak_price tracks lowest ctc (best profit achieved)
                 "peak_price": entry_price,
                 "trailing_activated": False,
                 "signal_scores": signal.individual_scores.copy(),
@@ -256,40 +280,88 @@ class BacktestEngine:
         return orb_df["high"].max(), orb_df["low"].min()
 
     def _check_exit(self, trade: dict, candle: pd.Series, t: dtime) -> Optional[str]:
+        if self.strategy_type == "sell_spread":
+            return self._check_exit_spread(trade, candle, t)
+        return self._check_exit_buy(trade, candle, t)
+
+    def _check_exit_buy(self, trade: dict, candle: pd.Series, t: dtime) -> Optional[str]:
         """
-        Check exit conditions using candle OHLC (conservative: assume SL before target).
+        Buy mode: estimate option price from index OHLC using ATM delta ≈ 0.5.
+        SL checked before target (conservative).
         """
         entry = trade["entry_price"]
-        peak = trade["peak_price"]
+        idx_entry = trade["index_entry_price"]
+        direction = trade["direction"]
+        delta = 0.5
 
-        # Update peak using candle high
-        if candle["high"] > peak:
-            trade["peak_price"] = candle["high"]
+        if direction == "CE":
+            opt_best  = max(entry + delta * (candle["high"] - idx_entry), 0.0)
+            opt_worst = max(entry + delta * (candle["low"]  - idx_entry), 0.0)
+        else:
+            opt_best  = max(entry + delta * (idx_entry - candle["low"]),  0.0)
+            opt_worst = max(entry + delta * (idx_entry - candle["high"]), 0.0)
+
+        if opt_best > trade["peak_price"]:
+            trade["peak_price"] = opt_best
             if not trade["trailing_activated"]:
-                peak_profit = (trade["peak_price"] - entry) / entry
-                if peak_profit >= self.trail_trigger_pct:
+                if (trade["peak_price"] - entry) / entry >= self.trail_trigger_pct:
                     trade["trailing_activated"] = True
 
-        # Check stop loss (use candle low — conservative)
-        sl_price = entry * (1 - self.sl_pct)
-        if candle["low"] <= sl_price:
+        if opt_worst <= entry * (1 - self.sl_pct):
             return "STOP_LOSS"
-
-        # Check target (use candle high)
-        target_price = entry * (1 + self.target_pct)
-        if candle["high"] >= target_price:
+        if opt_best >= entry * (1 + self.target_pct):
             return "TARGET"
-
-        # Check trailing SL (use candle low)
         if trade["trailing_activated"]:
-            trail_sl = trade["peak_price"] * (1 - self.trail_step_pct)
-            if candle["low"] <= trail_sl:
+            if opt_worst <= trade["peak_price"] * (1 - self.trail_step_pct):
                 return "TRAILING_SL"
-
-        # Time-based squareoff
         if t >= self._squareoff_time:
             return "SQUAREOFF"
+        return None
 
+    def _check_exit_spread(self, trade: dict, candle: pd.Series, t: dtime) -> Optional[str]:
+        """
+        Sell spread mode: track cost-to-close (ctc) using spread net delta.
+        CE (bullish → Bull Put Spread): ctc falls when index rises.
+        PE (bearish → Bear Call Spread): ctc falls when index falls.
+        profit_pct = (net_credit - ctc) / net_credit
+        """
+        net_credit = trade["entry_price"]
+        idx_entry  = trade["index_entry_price"]
+        direction  = trade["direction"]
+        d = self.spread_net_delta
+
+        # Best ctc (most favorable for seller) and worst ctc (most adverse)
+        if direction == "CE":  # Bull Put Spread: index up → ctc down
+            ctc_best  = max(min(net_credit - d * (candle["high"] - idx_entry), self.spread_width), 0.0)
+            ctc_worst = max(min(net_credit - d * (candle["low"]  - idx_entry), self.spread_width), 0.0)
+        else:  # Bear Call Spread: index down → ctc down
+            ctc_best  = max(min(net_credit - d * (idx_entry - candle["low"]),  self.spread_width), 0.0)
+            ctc_worst = max(min(net_credit - d * (idx_entry - candle["high"]), self.spread_width), 0.0)
+
+        # Update peak (lowest ctc = best achieved profit)
+        if ctc_best < trade["peak_price"]:
+            trade["peak_price"] = ctc_best
+            if not trade["trailing_activated"]:
+                peak_profit_pct = (net_credit - trade["peak_price"]) / net_credit
+                if peak_profit_pct >= self.trail_trigger_pct:
+                    trade["trailing_activated"] = True
+
+        # SL first: loss on worst case exceeds sl_loss_multiple * net_credit
+        if ctc_worst >= net_credit * (1 + self.sl_loss_multiple):
+            return "STOP_LOSS"
+
+        # Target: best case captured target_capture_pct of credit
+        if ctc_best <= net_credit * (1 - self.target_capture_pct):
+            return "TARGET"
+
+        # Trailing SL: ctc has risen above trail_step from peak
+        if trade["trailing_activated"]:
+            trail_sl_ctc = trade["peak_price"] * (1 + self.trail_step_pct)
+            if ctc_worst >= trail_sl_ctc:
+                return "TRAILING_SL"
+
+        if t >= self._squareoff_time:
+            return "SQUAREOFF"
         return None
 
     def _close_trade(
@@ -302,18 +374,46 @@ class BacktestEngine:
         trade = state.open_trade
         entry = trade["entry_price"]
 
-        # Determine exit price based on reason
-        if reason == "STOP_LOSS":
-            exit_price = entry * (1 - self.sl_pct)
-        elif reason == "TARGET":
-            exit_price = entry * (1 + self.target_pct)
-        elif reason == "TRAILING_SL":
-            exit_price = trade["peak_price"] * (1 - self.trail_step_pct)
-        else:
-            exit_price = candle["close"]
+        # Determine exit price and P&L
+        if self.strategy_type == "sell_spread":
+            net_credit = entry
+            idx_entry  = trade["index_entry_price"]
+            direction  = trade["direction"]
+            d = self.spread_net_delta
 
-        pnl = (exit_price - entry) * self.quantity
-        pnl_pct = (exit_price - entry) / entry
+            if reason == "STOP_LOSS":
+                ctc = min(net_credit * (1 + self.sl_loss_multiple), self.spread_width)
+            elif reason == "TARGET":
+                ctc = net_credit * (1 - self.target_capture_pct)
+            elif reason == "TRAILING_SL":
+                ctc = trade["peak_price"] * (1 + self.trail_step_pct)
+            else:  # SQUAREOFF / DATA_END
+                if direction == "CE":
+                    ctc = max(min(net_credit - d * (candle["close"] - idx_entry), self.spread_width), 0.0)
+                else:
+                    ctc = max(min(net_credit - d * (idx_entry - candle["close"]), self.spread_width), 0.0)
+
+            exit_price = round(ctc, 2)
+            pnl = (net_credit - ctc) * self.quantity
+            pnl_pct = (net_credit - ctc) / net_credit if net_credit > 0 else 0.0
+        else:
+            if reason == "STOP_LOSS":
+                exit_price = entry * (1 - self.sl_pct)
+            elif reason == "TARGET":
+                exit_price = entry * (1 + self.target_pct)
+            elif reason == "TRAILING_SL":
+                exit_price = trade["peak_price"] * (1 - self.trail_step_pct)
+            else:
+                delta = 0.5
+                idx_entry = trade["index_entry_price"]
+                direction = trade["direction"]
+                if direction == "CE":
+                    exit_price = max(entry + delta * (candle["close"] - idx_entry), 0.0)
+                else:
+                    exit_price = max(entry + delta * (idx_entry - candle["close"]), 0.0)
+
+            pnl = (exit_price - entry) * self.quantity
+            pnl_pct = (exit_price - entry) / entry
 
         bt_trade = BacktestTrade(
             symbol=trade["symbol"],

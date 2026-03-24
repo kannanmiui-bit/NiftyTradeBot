@@ -49,6 +49,55 @@ class OrderManager:
         logger.info(f"BUY order placed: order_id={order_id}")
         return str(order_id)
 
+    def place_sell_order(
+        self,
+        tradingsymbol: str,
+        quantity: int,
+        exchange: str = "NFO",
+        tag: str = "options_bot",
+    ) -> str:
+        """Place an intraday MIS SELL order (for option writing). Returns order_id."""
+        logger.info(f"Placing SELL (write) order: {tradingsymbol} qty={quantity}")
+        order_id = self.kite.place_order(
+            variety=KiteConnect.VARIETY_REGULAR,
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            transaction_type=KiteConnect.TRANSACTION_TYPE_SELL,
+            quantity=quantity,
+            product=KiteConnect.PRODUCT_MIS,
+            order_type=KiteConnect.ORDER_TYPE_MARKET,
+            tag=tag,
+        )
+        logger.info(f"SELL (write) order placed: order_id={order_id}")
+        return str(order_id)
+
+    def place_spread_open(
+        self,
+        sell_symbol: str,
+        buy_symbol: str,
+        quantity: int,
+        exchange: str = "NFO",
+    ) -> tuple[str, str]:
+        """Open a credit spread: sell one leg, buy the hedge leg."""
+        sell_id = self.place_sell_order(sell_symbol, quantity, exchange)
+        buy_id  = self.place_buy_order(buy_symbol, quantity, exchange)
+        logger.info(f"Spread opened: sell={sell_id} hedge={buy_id}")
+        return sell_id, buy_id
+
+    def place_spread_close(
+        self,
+        sell_symbol: str,
+        buy_symbol: str,
+        quantity: int,
+        reason: str,
+        exchange: str = "NFO",
+    ) -> tuple[str, str]:
+        """Close a credit spread: buy back sold leg, sell the hedge leg."""
+        buy_back_id  = self.place_buy_order(sell_symbol, quantity, exchange)
+        sell_back_id = self.place_exit_order(buy_symbol, quantity, reason, exchange)
+        logger.info(f"Spread closed ({reason}): buy_back={buy_back_id} sell_hedge={sell_back_id}")
+        return buy_back_id, sell_back_id
+
     def place_exit_order(
         self,
         tradingsymbol: str,

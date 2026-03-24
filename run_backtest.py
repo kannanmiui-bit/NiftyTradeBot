@@ -1,22 +1,19 @@
 """
 run_backtest.py — Standalone backtest runner.
+Loads all parameters from .env via config.py — no hardcoded values.
 
-Download historical Nifty 5-min data first:
-    pip install jugaad-data
-    python -c "
-from jugaad_data.nse import index_raw
-import pandas as pd
-df = index_raw('NIFTY 50', '01-01-2024', '31-12-2024')
-df.to_csv('data/nifty_5min.csv')
-"
+Download historical data first:
+    python download_data.py --index NIFTY --days 180
 
 Then run:
-    python run_backtest.py --csv data/nifty_5min.csv
+    python run_backtest.py --csv historical/nifty_5minute.csv
+    python run_backtest.py --csv historical/nifty_5minute.csv --mode buy
 """
 
 import argparse
 from datetime import date
 
+from config import load_config
 from backtest.engine import BacktestEngine
 from backtest.report import print_report, save_trade_log, plot_results
 from utils.logger import setup_logger
@@ -28,46 +25,68 @@ def main():
     parser = argparse.ArgumentParser(description="Run strategy backtest")
     parser.add_argument("--csv", required=True, help="Path to OHLCV CSV file")
     parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD")
-    parser.add_argument("--end", default=None, help="End date YYYY-MM-DD")
+    parser.add_argument("--end",   default=None, help="End date YYYY-MM-DD")
     parser.add_argument(
-        "--index", default="NIFTY", choices=["NIFTY", "BANKNIFTY"],
-        help="Index to backtest"
+        "--mode", default=None, choices=["buy", "sell_spread"],
+        help="Override STRATEGY_TYPE from .env"
     )
     args = parser.parse_args()
 
-    lot_size = 50 if args.index == "NIFTY" else 15
-    strike_step = 50 if args.index == "NIFTY" else 100
+    config = load_config()
+
+    # --mode flag overrides .env STRATEGY_TYPE
+    strategy_type = args.mode or config.strategy_type
 
     engine = BacktestEngine(
-        # Strategy defaults (tune these)
-        supertrend_period=7,
-        supertrend_mult=3.0,
-        rsi_period=14,
-        rsi_overbought=60,
-        rsi_oversold=40,
-        ema_fast=9,
-        ema_slow=21,
-        orb_end="09:45",
-        vwap_band_pct=0.003,
-        score_threshold=2,
-        # Risk defaults
-        target_pct=0.50,
-        sl_pct=0.30,
-        trail_trigger_pct=0.30,
-        trail_step_pct=0.20,
-        max_daily_loss=-5000,
-        max_trades_per_day=2,
-        no_new_trade_after="14:00",
-        squareoff_time="15:10",
-        # Position sizing
-        lot_size=lot_size,
-        num_lots=1,
+        # ── Strategy params (from .env) ───────────────────────────────────────
+        supertrend_period=config.supertrend_period,
+        supertrend_mult=config.supertrend_mult,
+        rsi_period=config.rsi_period,
+        rsi_overbought=config.rsi_overbought,
+        rsi_oversold=config.rsi_oversold,
+        ema_fast=config.ema_fast,
+        ema_slow=config.ema_slow,
+        orb_end=config.orb_end,
+        vwap_band_pct=config.vwap_band_pct,
+        score_threshold=config.score_threshold,
+        # ── Risk params (from .env) ───────────────────────────────────────────
+        target_pct=config.target_pct,
+        sl_pct=config.sl_pct,
+        trail_trigger_pct=config.trail_trigger_pct,
+        trail_step_pct=config.trail_step_pct,
+        max_daily_loss=config.max_daily_loss,
+        max_trades_per_day=config.max_trades_per_day,
+        no_new_trade_after=config.no_new_trade_after,
+        squareoff_time=config.squareoff_time,
+        # ── Position sizing (from .env) ───────────────────────────────────────
+        lot_size=config.lot_size,
+        num_lots=config.num_lots,
+        # ── Spread params (from .env) ─────────────────────────────────────────
+        strategy_type=strategy_type,
+        hedge_otm_strikes=config.hedge_otm_strikes,
+        strike_step=config.strike_step,
+        # ── Simulation-only params (no live equivalent, tune here) ────────────
+        option_premium_pct=0.015,   # rough ATM premium as % of index (buy mode)
+        credit_ratio=0.35,          # net credit as % of spread width (sell mode)
+        spread_net_delta=0.30,      # net delta of the spread
+        sl_loss_multiple=3.0,       # SL when loss = N * net_credit
+        target_capture_pct=0.50,    # TP when N% of credit captured
     )
+
+    print(f"\nBacktest config loaded from .env:")
+    print(f"  Strategy   : {strategy_type}")
+    print(f"  Index      : {config.index} | LotSize={config.lot_size} | Step={config.strike_step}")
+    print(f"  Score thr  : {config.score_threshold}")
+    print(f"  Target     : {config.target_pct:.0%} | SL: {config.sl_pct:.0%}")
+    print(f"  Trail trig : {config.trail_trigger_pct:.0%} | Step: {config.trail_step_pct:.0%}")
+    if strategy_type == "sell_spread":
+        print(f"  Hedge legs : {config.hedge_otm_strikes} strikes OTM")
+    print()
 
     df = engine.load_csv(args.csv)
 
     start = date.fromisoformat(args.start) if args.start else None
-    end = date.fromisoformat(args.end) if args.end else None
+    end   = date.fromisoformat(args.end)   if args.end   else None
 
     result = engine.run(df, start_date=start, end_date=end)
     stats = print_report(result)
