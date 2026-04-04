@@ -69,8 +69,23 @@ def main():
         option_premium_pct=0.015,   # rough ATM premium as % of index (buy mode)
         credit_ratio=0.35,          # net credit as % of spread width (sell mode)
         spread_net_delta=0.30,      # net delta of the spread
-        sl_loss_multiple=3.0,       # SL when loss = N * net_credit
-        target_capture_pct=0.50,    # TP when N% of credit captured
+        sl_loss_multiple=2.0,       # SL when loss = N * net_credit
+        target_capture_pct=0.60,    # TP when N% of credit captured
+        # ── New features (from .env) ──────────────────────────────────────────
+        atr_sl_mult=config.atr_sl_mult,
+        use_daily_trend=config.use_daily_trend,
+        volume_period=config.volume_period,
+        volume_mult=config.volume_mult,
+        daily_ema_fast=config.daily_ema_fast,
+        daily_ema_slow=config.daily_ema_slow,
+        # ── Economic calendar (from .env) ─────────────────────────────────────
+        use_calendar=config.use_calendar,
+        calendar_skip_rbi=config.calendar_skip_rbi,
+        calendar_skip_budget=config.calendar_skip_budget,
+        calendar_skip_fed=config.calendar_skip_fed,
+        calendar_skip_expiry_after=config.calendar_skip_expiry_after,
+        # ── Signal type (from .env) ───────────────────────────────────────────
+        signal_type=config.signal_type,
     )
 
     print(f"\nBacktest config loaded from .env:")

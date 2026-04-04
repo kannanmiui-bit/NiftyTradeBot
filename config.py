@@ -43,6 +43,24 @@ class BotConfig:
     strategy_type: str   # "buy" | "sell_spread"
     hedge_otm_strikes: int  # strikes OTM for hedge leg (sell_spread only)
 
+    # ── Enhanced features ────────────────────────────────────────────────────
+    volume_period: int
+    volume_mult: float
+    atr_sl_mult: float
+    use_daily_trend: bool
+    daily_ema_fast: int
+    daily_ema_slow: int
+
+    # ── Economic calendar ────────────────────────────────────────────────────
+    use_calendar: bool
+    calendar_skip_rbi: bool
+    calendar_skip_budget: bool
+    calendar_skip_fed: bool
+    calendar_skip_expiry_after: str
+
+    # ── Signal type ──────────────────────────────────────────────────────────
+    signal_type: str   # "breakout" | "multi_indicator"
+
     # ── Strategy params ──────────────────────────────────────────────────────
     supertrend_period: int
     supertrend_mult: float
@@ -97,6 +115,24 @@ def load_config() -> BotConfig:
         # Strategy type
         strategy_type=_opt("STRATEGY_TYPE", "buy"),
         hedge_otm_strikes=_opt("HEDGE_OTM_STRIKES", 2, int),
+
+        # Enhanced features
+        volume_period=_opt("VOLUME_PERIOD", 20, int),
+        volume_mult=_opt("VOLUME_MULT", 1.2, float),
+        atr_sl_mult=_opt("ATR_SL_MULT", 0.0, float),
+        use_daily_trend=_opt("USE_DAILY_TREND", "true").lower() == "true",
+        daily_ema_fast=_opt("DAILY_EMA_FAST", 5, int),
+        daily_ema_slow=_opt("DAILY_EMA_SLOW", 20, int),
+
+        # Economic calendar
+        use_calendar=_opt("USE_CALENDAR", "true").lower() == "true",
+        calendar_skip_rbi=_opt("CALENDAR_SKIP_RBI", "true").lower() == "true",
+        calendar_skip_budget=_opt("CALENDAR_SKIP_BUDGET", "true").lower() == "true",
+        calendar_skip_fed=_opt("CALENDAR_SKIP_FED", "true").lower() == "true",
+        calendar_skip_expiry_after=_opt("CALENDAR_SKIP_EXPIRY_AFTER", "13:00"),
+
+        # Signal type
+        signal_type=_opt("SIGNAL_TYPE", "breakout"),
 
         # Strategy
         supertrend_period=_opt("SUPERTREND_PERIOD", 7, int),

@@ -20,8 +20,13 @@ class ORBStrategy(BaseStrategy):
 
     def score(self, df: pd.DataFrame) -> int:
         # Guard: ORB not yet established
-        now = datetime.now(IST).time()
-        if now < self._orb_end:
+        # Use last candle timestamp (works on any system timezone, not just IST)
+        last_ts = df.index[-1]
+        if hasattr(last_ts, 'tz') and last_ts.tz is not None:
+            now_ist = last_ts.astimezone(IST)
+        else:
+            now_ist = IST.localize(last_ts)
+        if now_ist.time() < self._orb_end:
             logger.debug("ORB period not yet complete — scoring 0.")
             return 0
 

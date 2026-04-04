@@ -20,7 +20,9 @@ import pandas as pd
 import pytz
 
 from data.indicators import IndicatorEngine
+from data.economic_calendar import EventCalendar
 from strategy.selector import StrategySelector, SignalResult
+from strategy.breakout_selector import BreakoutSelector, SignalResult as BreakoutSignalResult
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -101,14 +103,31 @@ class BacktestEngine:
         spread_net_delta: float = 0.30,     # net delta of the spread
         sl_loss_multiple: float = 1.5,      # SL when loss = N * net_credit
         target_capture_pct: float = 0.50,   # TP when N% of credit captured
+        # ── New features ─────────────────────────────────────────────────────
+        atr_sl_mult: float = 0.0,           # >0: use ATR-based index SL (e.g. 2.0)
+        use_daily_trend: bool = True,       # skip trades against daily EMA trend
+        volume_period: int = 20,
+        volume_mult: float = 1.2,
+        daily_ema_fast: int = 5,
+        daily_ema_slow: int = 20,
+        # ── Economic calendar ────────────────────────────────────────────────
+        use_calendar: bool = True,
+        calendar_skip_rbi: bool = True,
+        calendar_skip_budget: bool = True,
+        calendar_skip_fed: bool = True,
+        calendar_skip_expiry_after: str = "13:00",
+        # ── Signal type ──────────────────────────────────────────────────────
+        signal_type: str = "breakout",      # "breakout" | "multi_indicator"
     ):
         self.indicators = IndicatorEngine(
-            supertrend_period, supertrend_mult, rsi_period, ema_fast, ema_slow
+            supertrend_period, supertrend_mult, rsi_period, ema_fast, ema_slow,
+            volume_period, daily_ema_fast, daily_ema_slow,
         )
         self.selector = StrategySelector(
             score_threshold, supertrend_period, supertrend_mult,
             rsi_period, rsi_overbought, rsi_oversold,
             ema_fast, ema_slow, orb_end, vwap_band_pct,
+            volume_period, volume_mult,
         )
         self.target_pct = target_pct
         self.sl_pct = sl_pct
@@ -126,6 +145,20 @@ class BacktestEngine:
         self.spread_net_delta = spread_net_delta
         self.sl_loss_multiple = sl_loss_multiple
         self.target_capture_pct = target_capture_pct
+        self.atr_sl_mult = atr_sl_mult
+        self.use_daily_trend = use_daily_trend
+        self.signal_type = signal_type
+        if signal_type == "breakout":
+            self.breakout_selector = BreakoutSelector(volume_mult=volume_mult)
+        else:
+            self.breakout_selector = None
+        self.use_calendar = use_calendar
+        self.calendar = EventCalendar(
+            skip_rbi=calendar_skip_rbi,
+            skip_budget=calendar_skip_budget,
+            skip_fed_next_day=calendar_skip_fed,
+            skip_expiry_after=calendar_skip_expiry_after,
+        ) if use_calendar else None
 
         nt_h, nt_m = map(int, no_new_trade_after.split(":"))
         self._no_new_trade_after = dtime(nt_h, nt_m)
@@ -179,6 +212,45 @@ class BacktestEngine:
         warmup = max(50, self.indicators.ema_slow * 3)  # candles needed
 
         logger.info(f"Backtesting {len(df)} candles from {df.index[0]} to {df.index[-1]}")
+        if self.calendar:
+            skipped = self.calendar.get_skipped_days(
+                df.index[0].date(), df.index[-1].date()
+            )
+            if skipped:
+                logger.info(f"Calendar: skipping {len(skipped)} high-impact days:")
+                for d, info in skipped:
+                    logger.info(f"  {d} — {info}")
+
+        # ── Pre-compute all indicators once ───────────────────────────────
+        # Compute ORB (30-min) and ORB15 (15-min) levels per day upfront
+        orb_highs: dict = {}
+        orb_lows: dict = {}
+        orb15_highs: dict = {}
+        orb15_lows: dict = {}
+        for day, group in df.groupby(df.index.date):
+            orb_df   = group.between_time("09:15", "09:44")
+            orb15_df = group.between_time("09:15", "09:29")
+            if not orb_df.empty:
+                orb_highs[day] = orb_df["high"].max()
+                orb_lows[day]  = orb_df["low"].min()
+            if not orb15_df.empty:
+                orb15_highs[day] = orb15_df["high"].max()
+                orb15_lows[day]  = orb15_df["low"].min()
+
+        # Compute indicators on full df, then inject range columns
+        enriched_full = self.indicators.compute_all(df)
+        enriched_full["ORB_HIGH"]   = pd.Series(
+            [orb_highs.get(ts.date(),   float("nan")) for ts in df.index],
+            index=df.index, dtype=float)
+        enriched_full["ORB_LOW"]    = pd.Series(
+            [orb_lows.get(ts.date(),    float("nan")) for ts in df.index],
+            index=df.index, dtype=float)
+        enriched_full["ORB15_HIGH"] = pd.Series(
+            [orb15_highs.get(ts.date(), float("nan")) for ts in df.index],
+            index=df.index, dtype=float)
+        enriched_full["ORB15_LOW"]  = pd.Series(
+            [orb15_lows.get(ts.date(),  float("nan")) for ts in df.index],
+            index=df.index, dtype=float)
 
         for i in range(warmup, len(df)):
             candle_time: datetime = df.index[i]
@@ -209,27 +281,56 @@ class BacktestEngine:
                 continue
             if t >= self._no_new_trade_after:
                 continue
-            if t < self._orb_end:
-                continue  # wait for ORB to establish
+            # For breakout: wait for 15-min range (09:30), else wait for 30-min ORB (09:45)
+            orb_wait = dtime(9, 30) if self.signal_type == "breakout" else self._orb_end
+            if t < orb_wait:
+                continue
 
-            # Build incremental DataFrame and compute indicators
-            current_df = df.iloc[:i+1]
-            orb_levels = self._compute_orb(current_df, today)
-            orb_high, orb_low = orb_levels if orb_levels else (None, None)
-            enriched = self.indicators.compute_all(current_df, orb_high, orb_low)
+            # ── Economic calendar gate ─────────────────────────────────────
+            if self.calendar and self.calendar.is_blackout(candle_time):
+                continue
 
-            signal = self.selector.evaluate(enriched)
+            # Use pre-computed enriched slice (last few rows sufficient for all strategies)
+            enriched = enriched_full.iloc[max(0, i - 4):i + 1]
+
+            if self.signal_type == "breakout":
+                signal = self.breakout_selector.evaluate(enriched)
+            else:
+                signal = self.selector.evaluate(enriched)
 
             if signal.direction is None:
                 continue
 
+            # ── Daily trend filter ─────────────────────────────────────────
+            if self.use_daily_trend and "DAILY_TREND" in enriched_full.columns:
+                daily_trend = enriched_full["DAILY_TREND"].iloc[i]
+                if daily_trend == 1 and signal.direction == "PE":
+                    continue  # skip bearish trade in daily uptrend
+                if daily_trend == -1 and signal.direction == "CE":
+                    continue  # skip bullish trade in daily downtrend
+
             # ── Open trade ─────────────────────────────────────────────────
+            atr_at_entry = (
+                float(enriched_full["ATR"].iloc[i])
+                if "ATR" in enriched_full.columns and not pd.isna(enriched_full["ATR"].iloc[i])
+                else None
+            )
+
             if self.strategy_type == "sell_spread":
-                net_credit = round(self.spread_width * self.credit_ratio, 2)
+                # ATR-based credit: reflects actual volatility on entry day
+                # Falls back to fixed formula if ATR unavailable
+                if atr_at_entry:
+                    net_credit = round(atr_at_entry * self.credit_ratio, 2)
+                else:
+                    net_credit = round(self.spread_width * self.credit_ratio, 2)
+                # Cap credit to spread width (max theoretical credit)
+                net_credit = min(net_credit, self.spread_width)
                 entry_price = net_credit
                 symbol = f"SPREAD_{signal.direction}_BT"
             else:
-                entry_price = self._estimate_option_premium(candle["close"], signal.direction)
+                entry_price = self._estimate_option_premium(
+                    candle["close"], signal.direction, atr=atr_at_entry
+                )
                 symbol = f"{signal.direction}_BT"
 
             state.open_trade = {
@@ -243,6 +344,7 @@ class BacktestEngine:
                 "peak_price": entry_price,
                 "trailing_activated": False,
                 "signal_scores": signal.individual_scores.copy(),
+                "atr_at_entry": atr_at_entry,
             }
             state.trade_count_today += 1
             logger.debug(
@@ -265,11 +367,16 @@ class BacktestEngine:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _estimate_option_premium(self, index_ltp: float, direction: str) -> float:
+    def _estimate_option_premium(self, index_ltp: float, direction: str,
+                                  atr: float = None) -> float:
         """
-        Rough ATM option premium estimate (1.5% of index by default).
-        Replace with actual historical options CSV lookup for accuracy.
+        ATM option premium estimate.
+        Uses ATR-based pricing when available (ATR × 0.6 ≈ 1-day ATM premium),
+        falls back to fixed % of index.
         """
+        if atr and atr > 0:
+            # ATM premium ≈ 0.6 × daily ATR (rough Black-Scholes approximation)
+            return round(atr * 0.6, 2)
         return round(index_ltp * self.option_premium_pct, 2)
 
     def _compute_orb(self, df: pd.DataFrame, today: date):
@@ -309,6 +416,16 @@ class BacktestEngine:
 
         if opt_worst <= entry * (1 - self.sl_pct):
             return "STOP_LOSS"
+
+        # ATR-based index SL: exit if index moves against by ATR * mult
+        if self.atr_sl_mult > 0 and trade.get("atr_at_entry"):
+            atr_sl_dist = self.atr_sl_mult * trade["atr_at_entry"]
+            idx_entry = trade["index_entry_price"]
+            if direction == "CE" and candle["low"] < idx_entry - atr_sl_dist:
+                return "STOP_LOSS"
+            if direction == "PE" and candle["high"] > idx_entry + atr_sl_dist:
+                return "STOP_LOSS"
+
         if opt_best >= entry * (1 + self.target_pct):
             return "TARGET"
         if trade["trailing_activated"]:

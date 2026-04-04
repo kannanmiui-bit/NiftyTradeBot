@@ -14,6 +14,7 @@ from strategy.rsi_strategy import RSIStrategy
 from strategy.orb_strategy import ORBStrategy
 from strategy.ema_strategy import EMAStrategy
 from strategy.vwap_strategy import VWAPStrategy
+from strategy.volume_strategy import VolumeStrategy
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -47,6 +48,8 @@ class StrategySelector:
         ema_slow: int = 21,
         orb_end: str = "09:45",
         vwap_band_pct: float = 0.003,
+        volume_period: int = 20,
+        volume_mult: float = 1.2,
     ):
         self.score_threshold = score_threshold
         self.strategies = [
@@ -55,6 +58,7 @@ class StrategySelector:
             ORBStrategy(orb_end),
             EMAStrategy(ema_fast, ema_slow),
             VWAPStrategy(vwap_band_pct),
+            VolumeStrategy(volume_period, volume_mult),
         ]
 
     def evaluate(self, df: pd.DataFrame) -> SignalResult:
@@ -94,5 +98,5 @@ class StrategySelector:
             individual_scores=scores,
             timestamp=timestamp,
         )
-        logger.info(str(result))
+        logger.debug(str(result))
         return result

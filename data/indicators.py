@@ -24,12 +24,18 @@ class IndicatorEngine:
         rsi_period: int = 14,
         ema_fast: int = 9,
         ema_slow: int = 21,
+        volume_period: int = 20,
+        daily_ema_fast: int = 5,
+        daily_ema_slow: int = 20,
     ):
         self.supertrend_period = supertrend_period
         self.supertrend_mult = supertrend_mult
         self.rsi_period = rsi_period
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
+        self.volume_period = volume_period
+        self.daily_ema_fast = daily_ema_fast
+        self.daily_ema_slow = daily_ema_slow
 
     def compute_all(
         self,
@@ -53,6 +59,9 @@ class IndicatorEngine:
         df = self._add_rsi(df)
         df = self._add_ema(df)
         df = self._add_vwap(df)
+        df = self._add_atr(df)
+        df = self._add_volume_metrics(df)
+        df = self._add_daily_trend(df)
 
         if orb_high is not None and orb_low is not None:
             df["ORB_HIGH"] = orb_high
@@ -180,6 +189,59 @@ class IndicatorEngine:
                 logger.debug(f"VWAP failed for {day}: {e}")
 
         df["VWAP_D"] = vwap_col
+        return df
+
+    # ── ATR ───────────────────────────────────────────────────────────────────
+
+    def _add_atr(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Expose ATR as a column (reuses TR computation from supertrend)."""
+        high, low, close = df["high"], df["low"], df["close"]
+        hl = high - low
+        hc = (high - close.shift(1)).abs()
+        lc = (low - close.shift(1)).abs()
+        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+        df["ATR"] = tr.ewm(span=self.supertrend_period, adjust=False).mean()
+        return df
+
+    # ── Volume ────────────────────────────────────────────────────────────────
+
+    def _add_volume_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Rolling average volume for volume confirmation scoring."""
+        df["VOL_MA"] = df["volume"].rolling(self.volume_period).mean()
+        return df
+
+    # ── Daily trend ───────────────────────────────────────────────────────────
+
+    def _add_daily_trend(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute EMA fast/slow on daily closes and map back to intraday rows.
+        Uses previous day's signal to avoid lookahead bias.
+        Adds DAILY_TREND column: +1 (uptrend), -1 (downtrend), 0 (insufficient data).
+        """
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df["DAILY_TREND"] = 0
+            return df
+
+        daily_close = df.groupby(df.index.date)["close"].last()
+        if len(daily_close) < self.daily_ema_slow + 1:
+            df["DAILY_TREND"] = 0
+            return df
+
+        ema_fast = daily_close.ewm(span=self.daily_ema_fast, adjust=False).mean()
+        ema_slow = daily_close.ewm(span=self.daily_ema_slow, adjust=False).mean()
+        trend = np.where(ema_fast > ema_slow, 1, -1)
+        trend_series = pd.Series(trend, index=daily_close.index)
+
+        # Shift by 1 day: use yesterday's daily trend for today's trades
+        trend_shifted = trend_series.shift(1)
+        date_to_trend = trend_shifted.to_dict()  # {date: +1/-1/NaN}
+
+        df["DAILY_TREND"] = [
+            int(date_to_trend[ts.date()])
+            if ts.date() in date_to_trend and not pd.isna(date_to_trend[ts.date()])
+            else 0
+            for ts in df.index
+        ]
         return df
 
     # ── Convenience accessors ─────────────────────────────────────────────────

@@ -123,11 +123,13 @@ class StrikeSelector:
         expiry = self.chain.get_current_expiry()
         atm = self.chain.get_atm_strike(index_ltp, self.strike_step)
 
-        sell_strike = atm
+        # Sell leg: ATM + otm_strikes above ATM (e.g. otm_strikes=1 → ATM+50)
+        sell_strike = atm + self.otm_strikes * self.strike_step
+        # Buy leg: hedge_otm_strikes × step below/above sell strike (not ATM)
         if opt_type == "PE":
-            buy_strike = atm - self.hedge_otm_strikes * self.strike_step
+            buy_strike = sell_strike - self.hedge_otm_strikes * self.strike_step
         else:
-            buy_strike = atm + self.hedge_otm_strikes * self.strike_step
+            buy_strike = sell_strike + self.hedge_otm_strikes * self.strike_step
 
         sell_token, sell_symbol = self.chain.get_option_token(sell_strike, opt_type, expiry)
         buy_token, buy_symbol = self.chain.get_option_token(buy_strike, opt_type, expiry)
