@@ -75,7 +75,7 @@ def main():
     logger.info("=" * 60)
     logger.info(f"  Nifty Options Bot starting | Index={config.index}")
     logger.info(f"  Mode={'PAPER' if paper_mode else 'LIVE'}")
-    logger.info(f"  Strategy: 5-way confluence | Threshold={config.score_threshold}")
+    logger.info(f"  Strategy: {config.strategy_type} ({config.signal_type}) | Threshold={config.score_threshold}")
     logger.info(
         f"  Risk: Target={config.target_pct:.0%} | SL={config.sl_pct:.0%} | "
         f"Trail trigger={config.trail_trigger_pct:.0%} | Trail step={config.trail_step_pct:.0%}"
@@ -182,7 +182,12 @@ def main():
             index_ltp = index_ltp_data[index_ltp_key]["last_price"]
 
             if config.strategy_type == "sell_spread":
-                spread = strike_sel.select_spread(signal, index_ltp)
+                try:
+                    spread = strike_sel.select_spread(signal, index_ltp)
+                except Exception as e:
+                    logger.error(f"Spread selection failed: {e}")
+                    notifier.alert_error(f"Spread selection failed: {e}")
+                    return
                 notifier.alert_entry(
                     f"SPREAD {spread.sell_tradingsymbol}/{spread.buy_tradingsymbol}",
                     spread.net_credit, signal.individual_scores, signal.direction
@@ -200,7 +205,12 @@ def main():
                 logger.info(f"Spread orders placed: sell={sell_id} hedge={buy_id}")
                 position_mgr.open_spread_position(spread, signal)
             else:
-                option = strike_sel.select(signal, index_ltp)
+                try:
+                    option = strike_sel.select(signal, index_ltp)
+                except Exception as e:
+                    logger.error(f"Option selection failed: {e}")
+                    notifier.alert_error(f"Option selection failed: {e}")
+                    return
                 notifier.alert_entry(
                     option.tradingsymbol, option.entry_ltp,
                     signal.individual_scores, signal.direction
@@ -319,7 +329,16 @@ def main():
 
     # ── Schedule jobs ────────────────────────────────────────────────────────
     interval_mins = CANDLE_INTERVAL_MINUTES.get(config.candle_interval, 5)
-    schedule.every(interval_mins).minutes.do(signal_check_job)
+
+    # Align signal checks to candle closes (09:15, 09:20, 09:25 ...) rather
+    # than firing from bot start time.  We schedule one job per aligned minute
+    # slot within the hour (e.g. :00, :05, :10, ... :55 for 5-minute candles).
+    aligned_slots = []
+    for m in range(0, 60, interval_mins):
+        slot = f":{m:02d}"
+        schedule.every().hour.at(slot).do(signal_check_job)
+        aligned_slots.append(slot)
+
     schedule.every(config.poll_seconds).seconds.do(position_monitor_job)
     schedule.every().day.at(config.squareoff_time).do(squareoff_all)
 
@@ -328,7 +347,7 @@ def main():
         f"Mode={'PAPER' if paper_mode else 'LIVE'}"
     )
     logger.info(
-        f"Scheduler running | Signal every {interval_mins}min | "
+        f"Scheduler running | Signal at {aligned_slots} each hour | "
         f"Monitor every {config.poll_seconds}s | Squareoff at {config.squareoff_time}"
     )
 
